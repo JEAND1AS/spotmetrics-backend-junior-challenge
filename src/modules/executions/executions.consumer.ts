@@ -8,7 +8,8 @@ import { currentMonth } from '../agents/agents.service';
 import { RabbitMQService } from '../../common/rabbitmq/rabbitmq.service';
 import { AgentExecution } from './agent-execution.entity';
 import { ExecutionStatus } from './execution-status.enum';
-import { ExecutionsService } from './executions.service';
+import { AgentMonthlyUsage } from '../agents/agent-monthly-usage.entity';
+import { env } from '../../config/env';
 import { countTokens, simulateAgentOutput } from './tokens';
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -16,14 +17,12 @@ const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 @Injectable()
 export class ExecutionsConsumer implements OnModuleInit {
   private readonly logger = new Logger(ExecutionsConsumer.name);
-  private readonly queue = process.env.RABBITMQ_EXECUTIONS_QUEUE ?? 'agent-executions';
-  private readonly delayMs = Number(process.env.PROCESSING_DELAY_MS ?? 2000);
-  private readonly prefetch = Number(process.env.RABBITMQ_PREFETCH ?? 5);
+  private readonly queue = env.rabbitmq.executionsQueue;
+  private readonly delayMs = env.processingDelayMs;
+  private readonly prefetch = env.rabbitmq.prefetch;
 
   constructor(
-    @InjectRepository(Agent) private readonly agents: Repository<Agent>,
     @InjectRepository(AgentExecution) private readonly executions: Repository<AgentExecution>,
-    private readonly executionsService: ExecutionsService,
     private readonly rabbit: RabbitMQService,
   ) {}
 
@@ -67,39 +66,64 @@ export class ExecutionsConsumer implements OnModuleInit {
   }
 
   async process(executionId: string): Promise<void> {
-    const execution = await this.executions.findOne({ where: { id: executionId } });
-    if (!execution) {
-      this.logger.warn(`Execution ${executionId} not found, skipping`);
+    const existing = await this.executions.findOne({ where: { id: executionId } });
+    if (!existing || ![ExecutionStatus.PENDING, ExecutionStatus.PROCESSING].includes(existing.status)) {
       return;
     }
 
-    execution.status = ExecutionStatus.PROCESSING;
-    execution.startedAt = new Date();
-    await this.executions.save(execution);
-    this.logger.log(`Execution ${execution.id} started`);
-
-    const agent = await this.agents.findOne({ where: { id: execution.agentId } });
-    if (!agent || !agent.active) {
-      execution.status = ExecutionStatus.FAILED;
-      execution.error = agent
-        ? `Agent ${execution.agentId} is inactive`
-        : `Agent ${execution.agentId} not found`;
-      execution.completedAt = new Date();
-      await this.executions.save(execution);
-      return;
-    }
-
+    // Preserve startedAt on redelivery; PROCESSING can be resumed after a crash.
+    await this.executions.update({ id: executionId, status: ExecutionStatus.PENDING }, {
+      status: ExecutionStatus.PROCESSING, startedAt: new Date(),
+    });
     await sleep(this.delayMs);
 
-    const output = simulateAgentOutput(agent.name, execution.input);
-    execution.output = output;
-    execution.outputTokens = countTokens(output);
-    execution.totalTokens = execution.inputTokens + execution.outputTokens;
-    execution.status = ExecutionStatus.COMPLETED;
-    execution.completedAt = new Date();
-    await this.executions.save(execution);
+    await this.executions.manager.transaction(async (manager) => {
+      const executions = manager.getRepository(AgentExecution);
+      const execution = await executions.findOne({
+        where: { id: executionId }, lock: { mode: 'pessimistic_write' },
+      });
+      if (!execution || execution.status !== ExecutionStatus.PROCESSING) return;
 
-    await this.executionsService.addTokensUsed(agent.id, currentMonth(), execution.totalTokens);
-    this.logger.log(`Execution ${execution.id} completed (${execution.totalTokens} tokens)`);
+      // Serialize quota checks for this agent, including its first usage row.
+      const agent = await manager.getRepository(Agent).findOne({
+        where: { id: execution.agentId }, lock: { mode: 'pessimistic_write' },
+      });
+      if (!agent || !agent.active) {
+        execution.status = ExecutionStatus.FAILED;
+        execution.error = agent
+          ? `Agent ${execution.agentId} is inactive`
+          : `Agent ${execution.agentId} not found`;
+        execution.completedAt = new Date();
+        await executions.save(execution);
+        return;
+      }
+
+      const output = simulateAgentOutput(agent.name, execution.input);
+      const inputTokens = countTokens(execution.input);
+      const outputTokens = countTokens(output);
+      const totalTokens = inputTokens + outputTokens;
+      const completedAt = new Date();
+      const month = currentMonth(completedAt);
+      const usage = manager.getRepository(AgentMonthlyUsage);
+      const row = await usage.findOne({ where: { agentId: agent.id, month } })
+        ?? usage.create({ agentId: agent.id, month, tokensUsed: 0 });
+
+      if (row.tokensUsed + totalTokens > agent.monthlyTokenLimit) {
+        execution.status = ExecutionStatus.FAILED;
+        execution.error = `Monthly token limit exceeded: used ${row.tokensUsed}, required ${totalTokens}, limit ${agent.monthlyTokenLimit}`;
+        execution.completedAt = completedAt;
+        await executions.save(execution);
+        return;
+      }
+
+      Object.assign(execution, {
+        output, inputTokens, outputTokens, totalTokens,
+        status: ExecutionStatus.COMPLETED, error: null, completedAt,
+      });
+      row.tokensUsed += totalTokens;
+      // Both writes commit together. A failure leaves PROCESSING available for retry.
+      await usage.save(row);
+      await executions.save(execution);
+    });
   }
 }

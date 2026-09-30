@@ -15,7 +15,10 @@ import { RabbitMQService } from '../../common/rabbitmq/rabbitmq.service';
 import { AgentExecution } from './agent-execution.entity';
 import { CreateExecutionDto } from './dto/create-execution.dto';
 import { ExecutionStatus } from './execution-status.enum';
-import { countTokens } from './tokens';
+import { ListExecutionsQueryDto } from './dto/list-executions-query.dto';
+import { ExecutionPageDto } from './dto/execution-response.dto';
+import { AgentMetricsDto } from '../agents/dto/agent-metrics.dto';
+import { countTokens, simulateAgentOutput } from './tokens';
 
 export interface ExecutionMessage {
   executionId: string;
@@ -39,14 +42,17 @@ export class ExecutionsService {
     if (!agent.active) throw new ConflictException(`Agent ${agentId} is inactive`);
 
     const inputTokens = countTokens(dto.input);
+    const outputTokens = countTokens(simulateAgentOutput(agent.name, dto.input));
+    const requiredTokens = inputTokens + outputTokens;
     const used = await this.getTokensUsed(agentId, currentMonth());
-    if (used + inputTokens > agent.monthlyTokenLimit) {
+    if (used + requiredTokens > agent.monthlyTokenLimit) {
       throw new HttpException(
         {
           statusCode: HttpStatus.TOO_MANY_REQUESTS,
           message: 'Monthly token limit exceeded',
           monthlyTokenLimit: agent.monthlyTokenLimit,
           tokensUsed: used,
+          requiredTokens,
         },
         HttpStatus.TOO_MANY_REQUESTS,
       );
@@ -69,6 +75,47 @@ export class ExecutionsService {
     }
 
     return execution;
+  }
+
+  async findByAgent(agentId: string, query: ListExecutionsQueryDto): Promise<ExecutionPageDto> {
+    await this.requireAgent(agentId);
+    const { page, limit, status, order } = query;
+    const [data, total] = await this.executions.findAndCount({
+      where: { agentId, ...(status === undefined ? {} : { status }) },
+      order: { createdAt: order, id: order },
+      skip: (page - 1) * limit,
+      take: limit,
+    });
+    return { data, total, page, limit, totalPages: Math.ceil(total / limit) };
+  }
+
+  async getMetrics(agentId: string): Promise<AgentMetricsDto> {
+    await this.requireAgent(agentId);
+    const row = await this.executions.createQueryBuilder('execution')
+      .select('COUNT(*)', 'totalExecutions')
+      .addSelect('COUNT(*) FILTER (WHERE execution.status = :completed)', 'completedExecutions')
+      .addSelect('COUNT(*) FILTER (WHERE execution.status = :failed)', 'failedExecutions')
+      .addSelect('COALESCE(SUM(execution.totalTokens) FILTER (WHERE execution.status = :completed), 0)', 'totalTokens')
+      .addSelect('COALESCE(AVG(execution.totalTokens) FILTER (WHERE execution.status = :completed), 0)', 'averageTokensPerExecution')
+      .where('execution.agentId = :agentId', { agentId })
+      .setParameters({ completed: ExecutionStatus.COMPLETED, failed: ExecutionStatus.FAILED })
+      .getRawOne();
+
+    // COUNT, SUM e AVG podem ser strings no driver PostgreSQL.
+    return {
+      agentId,
+      totalExecutions: Number(row.totalExecutions),
+      completedExecutions: Number(row.completedExecutions),
+      failedExecutions: Number(row.failedExecutions),
+      totalTokens: Number(row.totalTokens),
+      averageTokensPerExecution: Number(row.averageTokensPerExecution),
+    };
+  }
+
+  private async requireAgent(agentId: string): Promise<void> {
+    if (!await this.agents.findOne({ where: { id: agentId } })) {
+      throw new NotFoundException(`Agent ${agentId} not found`);
+    }
   }
 
   async findOne(id: string): Promise<AgentExecution> {

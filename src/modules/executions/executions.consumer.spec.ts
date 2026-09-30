@@ -1,61 +1,103 @@
 import { ConsumeMessage } from 'amqplib';
 import { ExecutionsConsumer } from './executions.consumer';
 import { ExecutionStatus } from './execution-status.enum';
+import { Agent } from '../agents/agent.entity';
+import { AgentExecution } from './agent-execution.entity';
 
+// Transaction mocks exercise business rules; PostgreSQL tests cover rollback and locks.
 describe('ExecutionsConsumer.process', () => {
+  let originalDelay: string | undefined;
   beforeEach(() => {
+    originalDelay = process.env.PROCESSING_DELAY_MS;
     process.env.PROCESSING_DELAY_MS = '0';
   });
+  afterEach(() => {
+    if (originalDelay === undefined) delete process.env.PROCESSING_DELAY_MS;
+    else process.env.PROCESSING_DELAY_MS = originalDelay;
+  });
 
-  function build(execution: object | null, agent: object | null) {
+  function build(status = ExecutionStatus.PENDING, used = 0, limit = 100) {
+    const execution = { id: 'e1', agentId: 'a1', input: 'hello', inputTokens: 1, status };
+    const agent = { id: 'a1', name: 'Bot', active: true, monthlyTokenLimit: limit };
     const agents = { findOne: jest.fn().mockResolvedValue(agent) };
-    const executions = { findOne: jest.fn().mockResolvedValue(execution), save: jest.fn(async (x) => x) };
-    const service = { addTokensUsed: jest.fn() };
-    const consumer = new ExecutionsConsumer(agents as any, executions as any, service as any, {} as any);
-    return { consumer, executions, service };
+    const usage = {
+      findOne: jest.fn().mockResolvedValue({ agentId: 'a1', tokensUsed: used }),
+      create: jest.fn(x => x), save: jest.fn(async x => x),
+    };
+    const executions = {
+      findOne: jest.fn().mockResolvedValue(execution),
+      save: jest.fn(async x => x),
+      update: jest.fn(async (where, changes) => {
+        if (execution.status === where.status) Object.assign(execution, changes);
+      }),
+      manager: { transaction: jest.fn(async callback => callback({
+        getRepository: entity => entity === Agent ? agents : entity === AgentExecution ? executions : usage,
+      })) },
+    };
+    const consumer = new ExecutionsConsumer(executions as any, {} as any);
+    return { consumer, execution, executions, agents, usage };
   }
 
-  it('completes a pending execution and records token usage', async () => {
-    const execution = { id: 'e1', agentId: 'a1', input: 'hello world', inputTokens: 2, status: ExecutionStatus.PENDING };
-    const { consumer, service } = build(execution, { id: 'a1', name: 'Bot', active: true });
-
+  it('completes and charges input plus output once on redelivery', async () => {
+    const { consumer, execution, usage } = build();
     await consumer.process('e1');
-
+    await consumer.process('e1');
     expect(execution.status).toBe(ExecutionStatus.COMPLETED);
-    expect(service.addTokensUsed).toHaveBeenCalledWith('a1', expect.any(String), execution['totalTokens']);
+    expect(usage.save).toHaveBeenCalledTimes(1);
+    expect(usage.save).toHaveBeenCalledWith(expect.objectContaining({ tokensUsed: 7 }));
   });
 
-  it('fails when the agent does not exist', async () => {
-    const execution = { id: 'e1', agentId: 'a1', input: 'x', inputTokens: 1, status: ExecutionStatus.PENDING };
-    const { consumer, service } = build(execution, null);
-
+  it.each([ExecutionStatus.COMPLETED, ExecutionStatus.FAILED])('skips terminal status %s', async status => {
+    const { consumer, executions, usage } = build(status);
     await consumer.process('e1');
-
-    expect(execution.status).toBe(ExecutionStatus.FAILED);
-    expect(service.addTokensUsed).not.toHaveBeenCalled();
+    expect(executions.update).not.toHaveBeenCalled();
+    expect(usage.save).not.toHaveBeenCalled();
   });
 
-  it('fails queued executions when the agent is inactive without charging tokens', async () => {
-    const execution = { id: 'e1', agentId: 'a1', input: 'hello', inputTokens: 1, status: ExecutionStatus.PENDING };
-    const { consumer, executions, service } = build(execution, { id: 'a1', name: 'Bot', active: false });
-
+  it('resumes PROCESSING without resetting startedAt', async () => {
+    const { consumer, execution } = build(ExecutionStatus.PROCESSING);
+    const startedAt = new Date('2026-01-01T00:00:00Z');
+    Object.assign(execution, { startedAt });
     await consumer.process('e1');
+    expect(execution).toMatchObject({ status: ExecutionStatus.COMPLETED, startedAt });
+  });
 
-    expect(executions.save).toHaveBeenLastCalledWith(expect.objectContaining({
-      status: ExecutionStatus.FAILED,
-      error: 'Agent a1 is inactive',
-      completedAt: expect.any(Date),
-    }));
+  it.each([9, 10, 11])('fails when total tokens exceed remaining quota (used %s)', async used => {
+    const { consumer, execution, usage } = build(ExecutionStatus.PENDING, used, 10);
+    await consumer.process('e1');
+    expect(execution).toMatchObject({ status: ExecutionStatus.FAILED, error: expect.stringContaining('Monthly token limit exceeded') });
     expect(execution).not.toHaveProperty('output');
-    expect(service.addTokensUsed).not.toHaveBeenCalled();
+    expect(usage.save).not.toHaveBeenCalled();
+  });
+
+  it('allows exact remaining quota', async () => {
+    const { consumer, execution, usage } = build(ExecutionStatus.PENDING, 3, 10);
+    await consumer.process('e1');
+    expect(execution.status).toBe(ExecutionStatus.COMPLETED);
+    expect(usage.save).toHaveBeenCalledWith(expect.objectContaining({ tokensUsed: 10 }));
+  });
+
+  it('creates the first usage row in the completion month', async () => {
+    const { consumer, execution, usage } = build();
+    usage.findOne.mockResolvedValueOnce(null);
+    await consumer.process('e1');
+    const month = (execution as any).completedAt.toISOString().slice(0, 7);
+    expect(usage.save).toHaveBeenCalledWith({ agentId: 'a1', month, tokensUsed: 7 });
+  });
+
+  it.each([null, { id: 'a1', active: false }])('fails missing or inactive agent without charging: %j', async agent => {
+    const { consumer, execution, agents, usage } = build();
+    agents.findOne.mockResolvedValueOnce(agent);
+    await consumer.process('e1');
+    expect(execution.status).toBe(ExecutionStatus.FAILED);
+    expect(usage.save).not.toHaveBeenCalled();
   });
 
   it('skips unknown executions', async () => {
-    const { consumer, executions } = build(null, null);
-
+    const { consumer, executions } = build();
+    executions.findOne.mockResolvedValueOnce(null);
     await consumer.process('missing');
-
-    expect(executions.save).not.toHaveBeenCalled();
+    expect(executions.update).not.toHaveBeenCalled();
   });
 });
 
@@ -72,7 +114,7 @@ describe('ExecutionsConsumer messages', () => {
       nack: jest.fn(),
     };
     const consumer = new ExecutionsConsumer(
-      {} as any, {} as any, {} as any, { getChannel: () => channel } as any,
+      {} as any, { getChannel: () => channel } as any,
     );
     const process = jest.spyOn(consumer, 'process').mockResolvedValue(undefined);
     await consumer.onModuleInit();

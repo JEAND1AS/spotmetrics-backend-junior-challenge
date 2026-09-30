@@ -17,6 +17,18 @@ services:
 
   rabbitmq:
     image: rabbitmq:3.13-management-alpine
+    volumes:
+      - ./rabbitmq/20-credentials.conf:/etc/rabbitmq/conf.d/20-credentials.conf:ro
+      - ./rabbitmq/spotmetrics_credential_validator.erl:/etc/rabbitmq/spotmetrics_credential_validator.erl:ro
+    environment:
+      RABBITMQ_SERVER_ADDITIONAL_ERL_ARGS: -pa /tmp/rabbitmq-validators
+    command:
+      - sh
+      - -ec
+      - |
+        mkdir -p /tmp/rabbitmq-validators
+        erlc -Werror -pa /opt/rabbitmq/plugins/rabbit-*/ebin -o /tmp/rabbitmq-validators /etc/rabbitmq/spotmetrics_credential_validator.erl
+        exec docker-entrypoint.sh rabbitmq-server
     ports:
       - "${RABBITMQ_HOST_PORT:-5672}:5672"
       - "${RABBITMQ_MGMT_HOST_PORT:-15672}:15672"
