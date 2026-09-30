@@ -1,13 +1,14 @@
 import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { ConsumeMessage } from 'amqplib';
+import { isUUID } from 'class-validator';
 import { Repository } from 'typeorm';
 import { Agent } from '../agents/agent.entity';
 import { currentMonth } from '../agents/agents.service';
 import { RabbitMQService } from '../../common/rabbitmq/rabbitmq.service';
 import { AgentExecution } from './agent-execution.entity';
 import { ExecutionStatus } from './execution-status.enum';
-import { ExecutionMessage, ExecutionsService } from './executions.service';
+import { ExecutionsService } from './executions.service';
 import { countTokens, simulateAgentOutput } from './tokens';
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -30,7 +31,7 @@ export class ExecutionsConsumer implements OnModuleInit {
     const channel = this.rabbit.getChannel();
     await channel.assertQueue(this.queue, { durable: true });
     await channel.prefetch(this.prefetch);
-    await channel.consume(this.queue, (msg) => void this.handle(msg));
+    await channel.consume(this.queue, (msg) => this.handle(msg));
     this.logger.log(`Consuming queue "${this.queue}"`);
   }
 
@@ -38,11 +39,20 @@ export class ExecutionsConsumer implements OnModuleInit {
     if (!msg) return;
     const channel = this.rabbit.getChannel();
 
-    let payload: ExecutionMessage;
+    let payload: unknown;
     try {
-      payload = JSON.parse(msg.content.toString()) as ExecutionMessage;
+      payload = JSON.parse(msg.content.toString());
     } catch {
       this.logger.warn('Discarding malformed message');
+      channel.nack(msg, false, false);
+      return;
+    }
+
+    if (
+      typeof payload !== 'object' || payload === null || Array.isArray(payload) ||
+      !('executionId' in payload) || typeof payload.executionId !== 'string' || !isUUID(payload.executionId)
+    ) {
+      this.logger.warn('Discarding message: executionId must be a valid UUID in a JSON object');
       channel.nack(msg, false, false);
       return;
     }
@@ -69,9 +79,11 @@ export class ExecutionsConsumer implements OnModuleInit {
     this.logger.log(`Execution ${execution.id} started`);
 
     const agent = await this.agents.findOne({ where: { id: execution.agentId } });
-    if (!agent) {
+    if (!agent || !agent.active) {
       execution.status = ExecutionStatus.FAILED;
-      execution.error = `Agent ${execution.agentId} not found`;
+      execution.error = agent
+        ? `Agent ${execution.agentId} is inactive`
+        : `Agent ${execution.agentId} not found`;
       execution.completedAt = new Date();
       await this.executions.save(execution);
       return;

@@ -1,4 +1,5 @@
 import {
+  ConflictException,
   HttpException,
   HttpStatus,
   Injectable,
@@ -35,6 +36,7 @@ export class ExecutionsService {
   async create(agentId: string, dto: CreateExecutionDto): Promise<AgentExecution> {
     const agent = await this.agents.findOne({ where: { id: agentId } });
     if (!agent) throw new NotFoundException(`Agent ${agentId} not found`);
+    if (!agent.active) throw new ConflictException(`Agent ${agentId} is inactive`);
 
     const inputTokens = countTokens(dto.input);
     const used = await this.getTokensUsed(agentId, currentMonth());

@@ -1,7 +1,8 @@
 import { Body, Controller, Get, Param, ParseUUIDPipe, Post, Query } from '@nestjs/common';
-import { ApiOperation, ApiQuery, ApiTags } from '@nestjs/swagger';
+import { ApiOperation, ApiTags } from '@nestjs/swagger';
 import { AgentsService } from './agents.service';
 import { CreateAgentDto } from './dto/create-agent.dto';
+import { GetAgentUsageQueryDto } from './dto/get-agent-usage-query.dto';
 
 @ApiTags('agents')
 @Controller('agents')
@@ -28,8 +29,7 @@ export class AgentsController {
 
   @Get(':id/usage')
   @ApiOperation({ summary: 'Consumo de tokens do agente no mês' })
-  @ApiQuery({ name: 'month', required: false, example: '2026-09' })
-  usage(@Param('id', ParseUUIDPipe) id: string, @Query('month') month?: string) {
-    return this.agentsService.getUsage(id, month);
+  usage(@Param('id', ParseUUIDPipe) id: string, @Query() query: GetAgentUsageQueryDto) {
+    return this.agentsService.getUsage(id, query.month);
   }
 }

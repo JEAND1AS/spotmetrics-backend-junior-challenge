@@ -42,6 +42,19 @@ describe('ExecutionsService.create', () => {
     await expect(service.create('x', { input: 'hi' })).rejects.toBeInstanceOf(NotFoundException);
   });
 
+  it('rejects inactive agents with 409 before saving or publishing an execution', async () => {
+    const { service, executions, usage, rabbit } = build({ agent: { ...agent, active: false } });
+
+    await expect(service.create('a1', { input: 'hello' })).rejects.toMatchObject({
+      status: 409,
+      message: 'Agent a1 is inactive',
+    });
+    expect(usage.findOne).not.toHaveBeenCalled();
+    expect(executions.create).not.toHaveBeenCalled();
+    expect(executions.save).not.toHaveBeenCalled();
+    expect(rabbit.publish).not.toHaveBeenCalled();
+  });
+
   it('returns 429 when the monthly limit would be exceeded', async () => {
     const { service, rabbit } = build({ usage: 9 });
     await expect(service.create('a1', { input: 'one two' })).rejects.toMatchObject({ status: 429 });
