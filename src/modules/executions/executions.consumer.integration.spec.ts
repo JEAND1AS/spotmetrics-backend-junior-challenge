@@ -5,6 +5,7 @@ import { Agent } from '../agents/agent.entity';
 import { AgentMonthlyUsage } from '../agents/agent-monthly-usage.entity';
 import { AgentExecution } from './agent-execution.entity';
 import { ExecutionsConsumer } from './executions.consumer';
+import { ExecutionsService } from './executions.service';
 import { ExecutionStatus } from './execution-status.enum';
 
 // Opt in with TEST_DATABASE_INTEGRATION=1. Uses only a newly created, isolated schema.
@@ -48,6 +49,28 @@ describeDatabase('Worker transactions in PostgreSQL', () => {
       agentId, input: 'hello', inputTokens: 1, status: ExecutionStatus.PENDING,
     });
   }
+
+  it('preserves a completed execution when the API loses the publication confirmation', async () => {
+    const agents = database.getRepository(Agent);
+    const agent = await agents.save({ name: 'Bot', systemPrompt: 'Help the user.', active: true, monthlyTokenLimit: 100 });
+    const rabbit = {
+      publish: jest.fn(async (_queue: string, payload: { executionId: string }) => {
+        await consumer.process(payload.executionId);
+        throw new Error('Simulated lost confirmation');
+      }),
+    };
+    const service = new ExecutionsService(
+      agents, database.getRepository(AgentExecution), database.getRepository(AgentMonthlyUsage), rabbit as any,
+    );
+    await expect(service.create(agent.id, { input: 'hello' })).rejects.toMatchObject({
+      status: 503, response: { executionId: expect.any(String) },
+    });
+    const executionId = rabbit.publish.mock.calls[0][1].executionId;
+    expect(await database.getRepository(AgentExecution).findOneByOrFail({ id: executionId }))
+      .toMatchObject({ status: ExecutionStatus.COMPLETED, totalTokens: 7, error: null });
+    expect(await database.getRepository(AgentMonthlyUsage).findOneByOrFail({ agentId: agent.id }))
+      .toMatchObject({ tokensUsed: 7 });
+  });
 
   it('charges once when the same message is processed concurrently and redelivered', async () => {
     const execution = await createExecution();

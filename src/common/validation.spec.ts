@@ -53,6 +53,60 @@ describe('Request validation', () => {
     return { status: response.status, body: await response.json() };
   }
 
+  describe('Reserved properties', () => {
+    const keys = ['constructor', 'prototype', '__proto__', 'toString', 'hasOwnProperty'];
+
+    describe.each([
+      { method: 'POST', path: '/agents', body: validAgent, service: agents.create },
+      { method: 'PATCH', path: `/agents/${agentId}`, body: { name: 'Updated Bot' }, service: agents.update },
+      { method: 'POST', path: `/agents/${agentId}/executions`, body: { input: 'Hello' }, service: executions.create },
+    ])('$method $path', ({ method, path, body, service }) => {
+      it.each(keys)('rejects the reserved body property %s before calling the service', async (key) => {
+        // Computed keys make __proto__ an own JSON property, not a prototype setter.
+        const response = await fetch(baseUrl + path, {
+          method,
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ ...body, [key]: 'unexpected' }),
+        });
+
+        expect(response.status).toBe(400);
+        expect(await response.json()).toMatchObject({
+          statusCode: 400,
+          message: `property ${key} should not exist`,
+        });
+        expect(service).not.toHaveBeenCalled();
+      });
+    });
+
+    describe.each([
+      { path: `/agents/${agentId}/usage`, query: 'month=2026-09', service: agents.getUsage },
+      { path: `/agents/${agentId}/executions`, query: 'page=1&limit=20', service: executions.findByAgent },
+    ])('GET $path', ({ path, query, service }) => {
+      it.each(keys)('rejects the reserved query property %s before calling the service', async (key) => {
+        const response = await fetch(`${baseUrl}${path}?${query}&${encodeURIComponent(key)}=unexpected`);
+
+        expect(response.status).toBe(400);
+        expect(await response.json()).toMatchObject({
+          statusCode: 400,
+          message: `property ${key} should not exist`,
+        });
+        expect(service).not.toHaveBeenCalled();
+      });
+    });
+  });
+
+  describe('POST body shape', () => {
+    it.each([[], [validAgent]].map(body => [body]))('rejects agent array bodies (case %#)', async (body) => {
+      expect((await post('/agents', body)).status).toBe(400);
+      expect(agents.create).not.toHaveBeenCalled();
+    });
+
+    it.each([[], [{ input: 'Hello' }]].map(body => [body]))('rejects execution array bodies (case %#)', async (body) => {
+      expect((await post(`/agents/${agentId}/executions`, body)).status).toBe(400);
+      expect(executions.create).not.toHaveBeenCalled();
+    });
+  });
+
   describe('GET /agents', () => {
     it('returns the list with numeric usage fields and documents them in Swagger', async () => {
       const result = [{
@@ -131,6 +185,17 @@ describe('Request validation', () => {
       }));
     });
 
+    it('preserves accents, joined emojis and multiline prompts', async () => {
+      const body = {
+        ...validAgent,
+        name: 'João 👩‍💻',
+        systemPrompt: 'Você é um assistente útil.\n\tResponda em português. 🤖',
+        description: 'Suporte técnico 👩‍💻',
+      };
+      expect((await post('/agents', body)).status).toBe(201);
+      expect(agents.create).toHaveBeenCalledWith(expect.objectContaining(body));
+    });
+
     it('accepts a name at the maximum length', async () => {
       expect((await post('/agents', { ...validAgent, name: 'a'.repeat(120) })).status).toBe(201);
     });
@@ -173,7 +238,7 @@ describe('Request validation', () => {
       },
     );
 
-    it.each(['x', 'a'.repeat(10000), '  First line\n  Second line\n'])(
+    it.each(['x', 'a'.repeat(10000), '  First line\n  Second line\n', 'Olá, João!\n\tComo você está?', '👩‍💻'])(
       'accepts valid input and preserves formatting (case %#)', async (input) => {
         const response = await post(`/agents/${agentId}/executions`, { input });
         expect(response.status).toBe(201);
@@ -222,6 +287,15 @@ describe('Request validation', () => {
       });
       return { status: response.status, body: await response.json() };
     }
+
+    it('preserves accents, joined emojis and multiline prompts in partial updates', async () => {
+      const body = {
+        name: 'João 👩‍💻',
+        systemPrompt: 'Você é um assistente útil.\n\tResponda em português. 🤖',
+      };
+      expect((await patch(body)).status).toBe(200);
+      expect(agents.update).toHaveBeenCalledWith(agentId, expect.objectContaining(body));
+    });
 
     it.each([{ name: '  New name  ' }, { active: false }, { active: true }, { description: null }, {}])(
       'accepts partial updates %j', async (body) => {

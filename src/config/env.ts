@@ -28,6 +28,9 @@ export const env = {
       url: process.env.RABBITMQ_URL ?? 'amqp://guest:guest@localhost:5672',
       executionsQueue: process.env.RABBITMQ_EXECUTIONS_QUEUE ?? 'agent-executions',
       prefetch: int('RABBITMQ_PREFETCH', 5, 1, 65535),
+      publishTimeoutMs: int('RABBITMQ_PUBLISH_TIMEOUT_MS', 5000, 1, 2147483647),
+      maxAttempts: int('RABBITMQ_MAX_ATTEMPTS', 3, 1, 100),
+      retryDelayMs: int('RABBITMQ_RETRY_DELAY_MS', 1000, 1, 2147483647),
     };
   },
   get processingDelayMs() {

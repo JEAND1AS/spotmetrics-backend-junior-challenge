@@ -25,12 +25,12 @@ export class ExecutionsController {
   @Post('agents/:agentId/executions')
   @ApiOperation({ summary: 'Enfileira uma execução para um agente ativo' })
   @ApiParam({ name: 'agentId', format: 'uuid', description: 'ID do agente que receberá a execução' })
-  @ApiCreatedResponse({ type: ExecutionResponseDto, description: 'Execução criada e enfileirada com status PENDING após validar o saldo para entrada + saída simulada. O worker verifica novamente o saldo atualizado antes de concluir.' })
+  @ApiCreatedResponse({ type: ExecutionResponseDto, description: 'Publicação confirmada pelo RabbitMQ após validar o saldo para entrada + saída simulada. A execução é criada como PENDING. O worker verifica novamente o saldo atualizado antes de concluir.' })
   @ApiBadRequestResponse({ description: 'agentId inválido ou corpo inválido. Envie um objeto JSON com input obrigatório (1 a 10000 caracteres, contendo texto).' })
   @ApiNotFoundResponse({ description: 'Agente não encontrado.' })
   @ApiConflictResponse({ description: 'Retornado somente quando o agente está inativo (active: false).' })
   @ApiTooManyRequestsResponse({ description: 'Saldo mensal insuficiente para os tokens de entrada + saída simulada. A execução não é criada nem enfileirada; a resposta informa monthlyTokenLimit, tokensUsed e requiredTokens.' })
-  @ApiServiceUnavailableResponse({ description: 'Fila indisponível. Tente novamente mais tarde.' })
+  @ApiServiceUnavailableResponse({ description: 'Publicação não confirmada (fila indisponível, rejeição ou timeout). A resposta inclui executionId: consulte seu status antes de repetir, pois a mensagem pode ter sido entregue.' })
   create(@Param('agentId', ParseUUIDPipe) agentId: string, @Body() dto: CreateExecutionDto) {
     return this.executionsService.create(agentId, dto);
   }

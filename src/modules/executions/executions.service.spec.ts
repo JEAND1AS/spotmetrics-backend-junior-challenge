@@ -14,6 +14,7 @@ function build(overrides: { usage?: number; agent?: object | null; publishFails?
     save: jest.fn(async (x) => ({ id: 'e1', ...x })),
     findOne: jest.fn(),
     findAndCount: jest.fn(),
+    update: jest.fn().mockResolvedValue({ affected: 1 }),
   };
   const usage = {
     findOne: jest.fn().mockResolvedValue(overrides.usage === undefined ? null : { tokensUsed: overrides.usage }),
@@ -22,10 +23,8 @@ function build(overrides: { usage?: number; agent?: object | null; publishFails?
   };
   const rabbit = {
     publish: overrides.publishFails
-      ? jest.fn(() => {
-          throw new Error('broker down');
-        })
-      : jest.fn(),
+      ? jest.fn().mockRejectedValue(new Error('broker down'))
+      : jest.fn().mockResolvedValue(undefined),
   };
   const service = new ExecutionsService(agents as any, executions as any, usage as any, rabbit as any);
   return { service, agents, executions, usage, rabbit };
@@ -38,6 +37,34 @@ describe('ExecutionsService.create', () => {
     expect(result.status).toBe(ExecutionStatus.PENDING);
     expect(result.inputTokens).toBe(3);
     expect(rabbit.publish).toHaveBeenCalledWith(expect.any(String), { executionId: 'e1' });
+  });
+
+  it('waits for asynchronous broker confirmation before returning success', async () => {
+    const { service, rabbit } = build();
+    let confirm!: () => void;
+    let publishing!: () => void;
+    const started = new Promise<void>(resolve => { publishing = resolve; });
+    rabbit.publish.mockImplementationOnce(() => {
+      publishing();
+      return new Promise<void>(resolve => { confirm = resolve; });
+    });
+    let finished = false;
+    const created = service.create('a1', { input: 'hello' }).then(result => { finished = true; return result; });
+    await started;
+    expect(finished).toBe(false);
+    confirm();
+    await expect(created).resolves.toMatchObject({ id: 'e1', status: ExecutionStatus.PENDING });
+  });
+
+  it('returns an execution id on an uncertain publication without overwriting a started execution', async () => {
+    const { service, executions, rabbit } = build();
+    rabbit.publish.mockRejectedValueOnce(new Error('confirmation timed out'));
+    executions.update.mockResolvedValueOnce({ affected: 0 });
+    await expect(service.create('a1', { input: 'hello' })).rejects.toMatchObject({
+      status: 503, response: { executionId: 'e1' },
+    });
+    expect(executions.update.mock.calls[0][0]).toEqual({ id: 'e1', status: ExecutionStatus.PENDING });
+    expect(executions.save).toHaveBeenCalledTimes(1);
   });
 
   it('throws 404 when agent does not exist', async () => {
@@ -67,8 +94,10 @@ describe('ExecutionsService.create', () => {
   it('marks the execution FAILED when the queue is unavailable', async () => {
     const { service, executions } = build({ publishFails: true });
     await expect(service.create('a1', { input: 'hi' })).rejects.toMatchObject({ status: 503 });
-    const lastSave = executions.save.mock.calls.at(-1)?.[0];
-    expect(lastSave.status).toBe(ExecutionStatus.FAILED);
+    expect(executions.update).toHaveBeenCalledWith({ id: 'e1', status: ExecutionStatus.PENDING }, {
+      status: ExecutionStatus.FAILED, error: 'Failed to confirm enqueue: broker down', completedAt: expect.any(Date),
+    });
+    expect(executions.save).toHaveBeenCalledTimes(1);
   });
 });
 

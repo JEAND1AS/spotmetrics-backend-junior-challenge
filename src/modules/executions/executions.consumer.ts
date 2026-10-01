@@ -20,6 +20,11 @@ export class ExecutionsConsumer implements OnModuleInit {
   private readonly queue = env.rabbitmq.executionsQueue;
   private readonly delayMs = env.processingDelayMs;
   private readonly prefetch = env.rabbitmq.prefetch;
+  private readonly maxAttempts = env.rabbitmq.maxAttempts;
+  private readonly retryDelayMs = env.rabbitmq.retryDelayMs;
+  private readonly failedQueue = `${this.queue}.failed`;
+  private consumerTag: string;
+  private pausePromise?: Promise<unknown>;
 
   constructor(
     @InjectRepository(AgentExecution) private readonly executions: Repository<AgentExecution>,
@@ -29,14 +34,24 @@ export class ExecutionsConsumer implements OnModuleInit {
   async onModuleInit(): Promise<void> {
     const channel = this.rabbit.getChannel();
     await channel.assertQueue(this.queue, { durable: true });
+    await channel.assertQueue(this.failedQueue, { durable: true });
     await channel.prefetch(this.prefetch);
-    await channel.consume(this.queue, (msg) => this.handle(msg));
+    const consumer = await channel.consume(this.queue, (msg) => this.handle(msg).catch((error) => {
+      // A closed channel automatically returns unacknowledged deliveries to RabbitMQ.
+      this.logger.error('Could not settle RabbitMQ delivery', (error as Error).stack);
+    }));
+    this.consumerTag = consumer.consumerTag;
     this.logger.log(`Consuming queue "${this.queue}"`);
   }
 
   private async handle(msg: ConsumeMessage | null): Promise<void> {
     if (!msg) return;
     const channel = this.rabbit.getChannel();
+    if (this.pausePromise) {
+      await this.pausePromise;
+      channel.nack(msg, false, true);
+      return;
+    }
 
     let payload: unknown;
     try {
@@ -56,13 +71,42 @@ export class ExecutionsConsumer implements OnModuleInit {
       return;
     }
 
+    const retryHeader = msg.properties?.headers?.['x-retry-count'];
+    const retries = retryHeader === undefined ? 0 : retryHeader;
+    if (!Number.isInteger(retries) || retries < 0 || retries >= this.maxAttempts) {
+      this.logger.warn('Discarding message: invalid x-retry-count');
+      channel.nack(msg, false, false);
+      return;
+    }
+
     try {
       await this.process(payload.executionId);
-      channel.ack(msg);
-    } catch (err) {
-      this.logger.error(`Error processing ${payload.executionId}, requeueing`, (err as Error).stack);
-      channel.nack(msg, false, true);
+    } catch (error) {
+      const attempt = retries + 1;
+      const exhausted = attempt >= this.maxAttempts;
+      const destination = exhausted ? this.failedQueue : this.queue;
+      const reason = error instanceof Error ? error.message : String(error);
+      this.logger.warn(`Execution ${payload.executionId} failed on attempt ${attempt}/${this.maxAttempts}: ${reason}`);
+      if (!exhausted) await sleep(this.retryDelayMs);
+      try {
+        await this.rabbit.publish(destination, { executionId: payload.executionId }, {
+          'x-retry-count': exhausted ? retries : attempt,
+          'x-attempts': attempt,
+          'x-last-error': reason.slice(0, 1000),
+        });
+      } catch (publishError) {
+        // Stop consuming before requeueing: no hot loop if the retry/failed queue
+        // cannot accept the message. Restart the worker after fixing the broker.
+        this.logger.error('Forwarding failed; pausing consumer. Restart worker after recovery.', (publishError as Error).stack);
+        this.pausePromise ??= channel.cancel(this.consumerTag);
+        await this.pausePromise;
+        channel.nack(msg, false, true);
+        return;
+      }
+      if (exhausted) this.logger.error(`Execution ${payload.executionId} moved to ${this.failedQueue}`);
     }
+    // Only settle the original after processing or confirmed forwarding.
+    channel.ack(msg);
   }
 
   async process(executionId: string): Promise<void> {

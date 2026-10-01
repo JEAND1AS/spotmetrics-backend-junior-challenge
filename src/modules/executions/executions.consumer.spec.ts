@@ -103,22 +103,24 @@ describe('ExecutionsConsumer.process', () => {
 
 describe('ExecutionsConsumer messages', () => {
   const executionId = '3b4f8f6e-1c2d-4a5b-9e8f-000000000001';
+  beforeEach(() => jest.useFakeTimers());
+  afterEach(() => jest.useRealTimers());
 
   async function build() {
     let handler: (msg: ConsumeMessage | null) => Promise<void>;
     const channel = {
       assertQueue: jest.fn(),
       prefetch: jest.fn(),
-      consume: jest.fn(async (_queue, callback) => { handler = callback; }),
+      consume: jest.fn(async (_queue, callback) => { handler = callback; return { consumerTag: 'worker' }; }),
+      cancel: jest.fn().mockResolvedValue({}),
       ack: jest.fn(),
       nack: jest.fn(),
     };
-    const consumer = new ExecutionsConsumer(
-      {} as any, { getChannel: () => channel } as any,
-    );
+    const rabbit = { getChannel: () => channel, publish: jest.fn().mockResolvedValue(undefined) };
+    const consumer = new ExecutionsConsumer({} as any, rabbit as any);
     const process = jest.spyOn(consumer, 'process').mockResolvedValue(undefined);
     await consumer.onModuleInit();
-    return { channel, process, handle: handler! };
+    return { channel, rabbit, process, handle: handler! };
   }
 
   it.each([
@@ -160,15 +162,81 @@ describe('ExecutionsConsumer messages', () => {
     expect(channel.nack).not.toHaveBeenCalled();
   });
 
-  it('requeues a valid message when processing fails', async () => {
-    const { channel, process, handle } = await build();
+  it('waits between attempts and acknowledges only after confirmed retry publication', async () => {
+    const { channel, rabbit, process, handle } = await build();
     process.mockRejectedValueOnce(new Error('database unavailable'));
+    let confirm!: () => void;
+    rabbit.publish.mockImplementationOnce(() => new Promise<void>(resolve => { confirm = resolve; }));
     const msg = { content: Buffer.from(JSON.stringify({ executionId })) } as ConsumeMessage;
+    const handled = handle(msg);
+    await jest.advanceTimersByTimeAsync(999);
+    expect(rabbit.publish).not.toHaveBeenCalled();
+    expect(channel.ack).not.toHaveBeenCalled();
+    await jest.advanceTimersByTimeAsync(1);
+    expect(rabbit.publish).toHaveBeenCalledWith('agent-executions', { executionId }, {
+      'x-retry-count': 1, 'x-attempts': 1, 'x-last-error': 'database unavailable',
+    });
+    expect(channel.ack).not.toHaveBeenCalled();
+    confirm();
+    await handled;
+    expect(channel.ack).toHaveBeenCalledWith(msg);
+    expect(channel.nack).not.toHaveBeenCalled();
+  });
 
-    await handle(msg);
+  it('stops after three failed attempts and confirms forwarding to the failed queue', async () => {
+    const { channel, rabbit, process, handle } = await build();
+    process.mockRejectedValue(new Error('database unavailable'));
+    for (let retries = 0; retries < 3; retries++) {
+      const msg = {
+        content: Buffer.from(JSON.stringify({ executionId })),
+        properties: { headers: { 'x-retry-count': retries } },
+      } as unknown as ConsumeMessage;
+      const handled = handle(msg);
+      await jest.advanceTimersByTimeAsync(1000);
+      await handled;
+    }
+    expect(process).toHaveBeenCalledTimes(3);
+    expect(rabbit.publish.mock.calls.map(call => call[0])).toEqual([
+      'agent-executions', 'agent-executions', 'agent-executions.failed',
+    ]);
+    expect(rabbit.publish).toHaveBeenLastCalledWith('agent-executions.failed', { executionId }, {
+      'x-retry-count': 2, 'x-attempts': 3, 'x-last-error': 'database unavailable',
+    });
+    expect(channel.ack).toHaveBeenCalledTimes(3);
+    expect(channel.nack).not.toHaveBeenCalled();
+  });
 
+  it.each([0, 2])('pauses consumption and retains the original when forwarding fails (retry count %s)', async (retries) => {
+    const { channel, rabbit, process, handle } = await build();
+    process.mockRejectedValue(new Error('database unavailable'));
+    rabbit.publish.mockRejectedValue(new Error('broker rejected message'));
+    const msg = {
+      content: Buffer.from(JSON.stringify({ executionId })),
+      properties: { headers: { 'x-retry-count': retries } },
+    } as unknown as ConsumeMessage;
+    const handled = handle(msg);
+    await jest.advanceTimersByTimeAsync(1000);
+    await handled;
+    expect(channel.cancel).toHaveBeenCalledWith('worker');
     expect(channel.ack).not.toHaveBeenCalled();
     expect(channel.nack).toHaveBeenCalledWith(msg, false, true);
+    expect(channel.cancel.mock.invocationCallOrder[0]).toBeLessThan(channel.nack.mock.invocationCallOrder[0]);
+    await handle(msg);
+    expect(process).toHaveBeenCalledTimes(1);
+    expect(rabbit.publish).toHaveBeenCalledTimes(1);
+    expect(channel.cancel).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([-1, 1.5, '1', 3, null])('rejects invalid retry metadata %j', async (retries) => {
+    const { channel, rabbit, process, handle } = await build();
+    const msg = {
+      content: Buffer.from(JSON.stringify({ executionId })),
+      properties: { headers: { 'x-retry-count': retries } },
+    } as unknown as ConsumeMessage;
+    await handle(msg);
+    expect(process).not.toHaveBeenCalled();
+    expect(rabbit.publish).not.toHaveBeenCalled();
+    expect(channel.nack).toHaveBeenCalledWith(msg, false, false);
   });
 
   it('ignores consumer cancellation notifications', async () => {

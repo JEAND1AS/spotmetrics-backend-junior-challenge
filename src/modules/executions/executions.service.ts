@@ -65,13 +65,19 @@ export class ExecutionsService {
     try {
       await this.rabbit.publish(this.queue, { executionId: execution.id } satisfies ExecutionMessage);
     } catch (err) {
-      // Não deixa uma execução "PENDING" órfã caso a fila esteja fora.
-      execution.status = ExecutionStatus.FAILED;
-      execution.error = `Failed to enqueue: ${(err as Error).message}`;
-      execution.completedAt = new Date();
-      await this.executions.save(execution);
+      // A confirmation can be lost after delivery. Never overwrite work that
+      // the worker has already started or completed while the API was waiting.
+      await this.executions.update({ id: execution.id, status: ExecutionStatus.PENDING }, {
+        status: ExecutionStatus.FAILED,
+        error: `Failed to confirm enqueue: ${(err as Error).message}`,
+        completedAt: new Date(),
+      });
       this.logger.error(`Failed to publish execution ${execution.id}`, (err as Error).stack);
-      throw new HttpException('Queue unavailable, try again later', HttpStatus.SERVICE_UNAVAILABLE);
+      throw new HttpException({
+        statusCode: HttpStatus.SERVICE_UNAVAILABLE,
+        message: 'Could not confirm publication; check execution status before retrying',
+        executionId: execution.id,
+      }, HttpStatus.SERVICE_UNAVAILABLE);
     }
 
     return execution;

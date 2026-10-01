@@ -4,6 +4,9 @@ const settings = [
   ['PORT', () => env.port, 3000, 1, 65535],
   ['DATABASE_PORT', () => env.database.port, 5432, 1, 65535],
   ['RABBITMQ_PREFETCH', () => env.rabbitmq.prefetch, 5, 1, 65535],
+  ['RABBITMQ_PUBLISH_TIMEOUT_MS', () => env.rabbitmq.publishTimeoutMs, 5000, 1, 2147483647],
+  ['RABBITMQ_MAX_ATTEMPTS', () => env.rabbitmq.maxAttempts, 3, 1, 100],
+  ['RABBITMQ_RETRY_DELAY_MS', () => env.rabbitmq.retryDelayMs, 1000, 1, 2147483647],
   ['PROCESSING_DELAY_MS', () => env.processingDelayMs, 2000, 0, 2147483647],
 ] as const;
 
