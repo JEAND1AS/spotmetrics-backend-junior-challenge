@@ -28,9 +28,13 @@ em "create-agent.dto.ts" permitia a criação de agentes com nomes e prompts con
 
 **executions.service.ts:**
 
-- active: false permitia executar agentes inativos, então foi implementado uma consulta para verificar o estado dos agente antes de fazer a execução.
+`active: false` permitia executar agentes inativos
 
-- Se o agente tiver inativo ao tentar ser executado, o WORKER registra FAILED na execução com motivos e não cobra tokens depois do enfileiramento.
+*Solução:*
+
+- Foi implementado uma consulta para verificar o estado dos agente antes de fazer a execução.
+
+- Se o agente já estiver inativo ao receber a requisição, a API retorna `409` sem criar nem enfileirar a execução (`src/modules/executions/executions.service.ts`, método `create`). Se a execução já tiver sido enfileirada e o agente estiver inativo quando o worker verificar seu estado no processamento, o worker registra `FAILED` com o motivo e não cobra tokens (`src/modules/executions/executions.consumer.ts`).
 
 - Também exige uma mensagem JSON contendo um objeto com executionId UUID válido para validação no worker (evita enviar mensagens inválidas, reenvio para as filas e gerar logs repetitivos)
 
@@ -52,7 +56,10 @@ em "create-agent.dto.ts" permitia a criação de agentes com nomes e prompts con
 
 **executions.consumer.ts**
 
-- Anteriormente, foi identificado que uma mensagem repetida (mesmo ID) podia processar e cobrar a mesma execução novamente.
+Anteriormente, foi identificado que uma mensagem repetida (mesmo ID) podia processar e cobrar a mesma execução novamente.
+
+*Solução:*
+
 - Agora valida o custo total, verificação de estado e retomada de PROCESSING, transação com bloqueios e uso das configurações. 
 
 **create-agent.dto.ts**
@@ -69,11 +76,15 @@ em "create-agent.dto.ts" permitia a criação de agentes com nomes e prompts con
 
 **POST /agents/{agentId}/executions**
 
-- A API já verificava o consumo mensal, mas validava apenas os tokens de entrada que o agente tinha antes de enfileirar. Então acontecia que o `POST /agents/{agentId}/executions` dava 201, mas quando ia para as consultas de uma execução `GET /executions/{id}`, mostrava que chegou ao limite de token e a quantidade que seria necessário.
+A API já verificava o saldo mensal antes de enfileirar, mas considerava apenas os tokens de entrada. Faltava verificar o custo total de entrada + saída simulada; por isso, uma execução podia receber `201` e depois ser marcada como `FAILED` pelo worker por saldo insuficiente.
 
-- Foi feito uma validação, e agora da erro 429 na rota `POST /agents/{agentId}/executions` e mostra a quantidade requerida de token para aquela execução.
+*Solução:*
 
-- A rota  dava 201, mas quando ia para as consultas de uma execução também está mostrando a quantidade de token gasto na entrada e saida
+- Em `src/modules/executions/executions.service.ts`, método `create`, a API agora soma os tokens de entrada e de saída simulada e verifica esse custo total contra o saldo mensal antes de criar ou enfileirar a execução.
+
+- Se o saldo for insuficiente, `POST /agents/{agentId}/executions` retorna `429` e informa `monthlyTokenLimit`, `tokensUsed` e `requiredTokens`.
+
+- O `201` confirma que a execução passou pela validação e foi enfileirada, mas não reserva tokens. Em `src/modules/executions/executions.consumer.ts`, o worker verifica novamente o custo total contra o consumo atualizado; se o saldo estiver insuficiente, registra `FAILED` sem cobrar tokens. Quando concluída, a execução consultada por `GET /executions/{id}` informa os tokens de entrada, saída e total.
 
 ## Erro crítico:
 
@@ -81,27 +92,27 @@ em "create-agent.dto.ts" permitia a criação de agentes com nomes e prompts con
 
 Era permitido criar e logar com usuários que continham somente espaços vazios no login e senha.
 
+*Soluções:*
+
 `rabbitmq/20-credentials.conf` - Configura o validador personalizado implementado em Erlang.
 
 `rabbitmq/spotmetrics_credential_validator.erl` - Valida o username e password contra espaços.
 
 `docker-compose.yml` - Carrega o módulo na inicialização, que no caso é o arquivo `rabbitmq/spotmetrics_credential_validator.erl`
 
-## Riscos
+## Riscos observados
 
-- **Reenvio sem limite de tentativas:** 
+**Problema com Reenvios sem liimite de tentativa**
 
-- erros técnicos agora têm 3 tentativas no total, com 1 segundo entre os reenvios. Ao atingir o limite, a mensagem vai para `agent-executions.failed`, com o ID, a quantidade de tentativas e o último erro nos headers. Isso evita repetir indefinidamente uma falha de processamento. Os valores podem ser configurados no `.env`.
+- Observado um comportamento de risco, quando uma fila falhava, ela dava erro e continuava tentando sem limites, podendo gerar uma quebra.
+
+*Solução:* Agora os erros técnicos tem 3 tentativas no totais, com 1 segundo entre os reenvios. Caso atinja o limite de 3, a mensagem é enviada para a fila de falhas `agent-executions.failed`, com o ID e a quantidade de tentativas com o último erro nos headers. 
 
 **Publicação sem confirmação do Rabbit** 
 
-- agora a publicação usa um canal com confirmação do broker, mensagens persistentes e verificação de roteamento. A API aguarda essa confirmação antes do 201 e limita a espera a 5 segundos por padrão. Se falhar, retorna 503 com o ID da execução, desde que consiga registrar o resultado no banco. Uma execução ainda PENDING é marcada FAILED; estados já alterados pelo worker são preservados, pois perder a confirmação não significa necessariamente perder a mensagem.
+- Uma publicação era enviada sem confirmação e validação do Rabbit
 
-**Falha ao encaminhar uma tentativa** 
-
-- o worker só confirma a mensagem original depois de confirmar a nova publicação. Se não conseguir encaminhar, pausa o consumo e devolve a mensagem à fila. Depois de recuperar o Rabbit, é necessário reiniciar o worker. Preferi preservar a mensagem e parar as tentativas automáticas nesse caso.
-
-
+*Solução:* Agora utilizamos um canal de confirmação do broker, mensagens persistentes e verificação de roteamento. A API aguarda essa confirmação antes do 201 e irá limitar a espera por 5 segundos por padrão. Se falhar, retorna 503 com o ID da execução.
 
 ## Implementações:
 
@@ -134,6 +145,21 @@ Motivo: Para uma consulta, Incluí consumo mensal, saldo e consumo diário para 
 
 `spotmetrics_credential_validator.erl`- Valida o username e password contra espaços.
 
+`rabbitmq.service.spec.ts` - Implementado testes uniitários de confirmações, rejeição, mensagens sem destinos, timeout (Após atingir um tempo de resposta), confirmações atrasadas, publicações simultânes, fechamento do canal e limpeza dos temporizadores.
+
+`rabbitmq.integration.spec.ts` -  Testes reais para publicação persistente, mensagens sem destino, recuperação na segunda tentativa e encaminhamento à fila de falhas após três tentativas.
+
+## Validação no banco de dados
+
+DTOs ja validava regra de negócios (tokens negativos, limite mensal fora de 1 a 100.000.000, status diferentes e mes fora do esperado), mas, gravações diretas no banco de dados permitia todos esses problemas.
+
+*Solução:* Foi adicionado validações por `CHECK`, no qual também fiz um migration.
+
+*Testes:* Testes feito pelo `DBeanver`
+
+**"Problema" não solucionados e possivel melhoria**
+
+- O projeto apesar de usar a API do Rabbit e o usuário Guest, ele não salva novos usuários em nosso banco de dados, não corrigi por não ser um projeto pronto e grande. Em um cenário como a SpotMetrics, poderia ser interessante caso a gente queira traçar vínculo com uma empresa e histórico de aprovações dessa mensageria.
 
 
 

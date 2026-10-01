@@ -1,6 +1,7 @@
-import { Column, CreateDateColumn, Entity, PrimaryGeneratedColumn, UpdateDateColumn } from 'typeorm';
+import { Check, Column, CreateDateColumn, Entity, PrimaryGeneratedColumn, UpdateDateColumn } from 'typeorm';
 
 @Entity({ name: 'agents' })
+@Check('chk_agents_monthly_token_limit', '"monthly_token_limit" BETWEEN 1 AND 100000000')
 export class Agent {
   @PrimaryGeneratedColumn('uuid')
   id: string;

@@ -1,7 +1,9 @@
-import { Column, CreateDateColumn, Entity, Index, PrimaryGeneratedColumn } from 'typeorm';
+import { Check, Column, CreateDateColumn, Entity, Index, PrimaryGeneratedColumn } from 'typeorm';
 import { ExecutionStatus } from './execution-status.enum';
 
 @Entity({ name: 'agent_executions' })
+@Check('chk_agent_executions_tokens', '"input_tokens" >= 0 AND "output_tokens" >= 0 AND "total_tokens" >= 0')
+@Check('chk_agent_executions_status', `"status" IN ('PENDING', 'PROCESSING', 'COMPLETED', 'FAILED')`)
 export class AgentExecution {
   @PrimaryGeneratedColumn('uuid')
   id: string;
