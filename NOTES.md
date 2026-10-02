@@ -153,13 +153,115 @@ Motivo: Para uma consulta, Incluí consumo mensal, saldo e consumo diário para 
 
 DTOs ja validava regra de negócios (tokens negativos, limite mensal fora de 1 a 100.000.000, status diferentes e mes fora do esperado), mas, gravações diretas no banco de dados permitia todos esses problemas.
 
-*Solução:* Foi adicionado validações por `CHECK`, no qual também fiz um migration.
+*Solução:* Foi adicionado validações por `CHECK`, no qual foi feito um migration.
 
 *Testes:* Testes feito pelo `DBeanver`
 
 **"Problema" não solucionados e possivel melhoria**
 
 - O projeto apesar de usar a API do Rabbit e o usuário Guest, ele não salva novos usuários em nosso banco de dados, não corrigi por não ser um projeto pronto e grande. Em um cenário como a SpotMetrics, poderia ser interessante caso a gente queira traçar vínculo com uma empresa e histórico de aprovações dessa mensageria.
+
+## Teste finais e validações feito pelo Swagger e Banco
+
+*Criar agente* - `POST /agents`
+`{`
+  "id": "ce7625b0-3427-4534-88f0-38761feb0970",
+  "name": "bot-teste-final",
+  "description": "Responde dúvidas de clientes",
+  "systemPrompt": "Você é um assistente de suporte cordial.",
+  "active": true,
+  "monthlyTokenLimit": 100,
+  "createdAt": "2026-10-02T12:44:03.639Z",
+  "updatedAt": "2026-10-02T12:44:03.639Z"
+`}`
+
+*Execution* - `POST /agents/{agentId}/executions`
+`{`
+  "id": "d2b0c265-415b-433a-b58f-fe9919c6dee3",
+  "agentId": "ce7625b0-3427-4534-88f0-38761feb0970",
+  "input": "Resuma o arquivo NOTES.md",
+  "output": null,
+  "status": "PENDING",
+  "error": null,
+  "inputTokens": 4,
+  "outputTokens": 0,
+  "totalTokens": 0,
+  "createdAt": "2026-10-02T14:07:20.515Z",
+  "startedAt": null,
+  "completedAt": null
+`}`
+
+*Atualizar* - `PATCH /agents/{id}`
+`{`
+  "id": "ce7625b0-3427-4534-88f0-38761feb0970",
+  "name": "bot teste-final",
+  "description": "Responde dúvidas de clientes",
+  "systemPrompt": "Você é um assistente de suporte cordial.",
+  "active": true,
+  "monthlyTokenLimit": 200,
+  "createdAt": "2026-10-02T12:44:03.639Z",
+  "updatedAt": "2026-10-02T14:08:32.582Z"
+`}`
+
+
+*Execution* - `POST /agents/{agentId}/executions`
+`{`
+  "id": "42807beb-5484-4e21-91a9-d9b2baf43305",
+  "agentId": "ce7625b0-3427-4534-88f0-38761feb0970",
+  "input": "Lorem ipsum dolor sit amet, consectetur adipiscing elit. Pellentesque odio velit, sodales vitae eleifend quis, molestie non arcu. Nulla venenatis porttitor quam, eu faucibus lectus semper viverra. Phasellus at viverra metus. Nullam pharetra, dui quis condimentum tempor, ex mauris interdum eros, vel pretium erat sapien a risus. Suspendisse potenti. Sed ligula magna, mattis vitae libero et, imperdiet blandit urna. Ut feugiat est eu sem rhoncus tempus. Sed a lobortis magna. Phasellus vestibulum vehicula nunc, lobortis finibus erat efficitur in. Donec placerat magna id maximus vehicula. Vestibulum imperdiet, urna viverra tempor ultrices, lorem diam gravida magna, sit amet tristique nunc mi vitae augue. Donec tincidunt sollicitudin massa. Nullam feugiat aliquam quam quis consectetur. Proin malesuada aliquam sodales. Sed scelerisque euismod libero et efficitur.Suspendisse non rutrum nisl. Praesent enim tortor, fermentum sed nisi eu, volutpat posuere tortor. Nullam sollicitudin scelerisque lacus, sed faucibus libero. Interdum et malesuada fames ac ante ipsum primis in faucibus. Integer iaculis elementum aliquam. Pellentesque accumsan metus eget nulla consequat efficitur. Suspendisse tincidunt euismod nisi at porta.",
+  "output": null,
+  "status": "PENDING",
+  "error": null,
+  "inputTokens": 169,
+  "outputTokens": 0,
+  "totalTokens": 0,
+  "createdAt": "2026-10-02T14:11:17.743Z",
+  "startedAt": null,
+  "completedAt": null
+`}`
+
+
+*Desativar* - `DELETE /agents/{id}`
+
+`HTTP: 204` - Retorna corpo vazio
+
+ connection: keep-alive 
+ date: Fri,02 Oct 2026 14:11:56 GMT 
+ keep-alive: timeout=5 
+ x-powered-by: Express 
+
+
+*Execution* - `POST /agents/{agentId}/executions`
+`{`
+  "message": "Agent ce7625b0-3427-4534-88f0-38761feb0970 is inactive",
+  "error": "Conflict",
+  "statusCode": 409
+`}`
+
+*Worker Stop* - `docker compose stop worker`
+parado..
+
+*ativar agente*
+ connection: keep-alive 
+ date: Fri,02 Oct 2026 14:14:14 GMT 
+ keep-alive: timeout=5 
+ x-powered-by: Express
+
+*Execution*  - `POST /agents/{agentId}/executions`
+`{`
+  "message": "Agent ce7625b0-3427-4534-88f0-38761feb0970 is inactive",
+  "error": "Conflict",
+  "statusCode": 409
+`}`
+
+*Worker Start* - `docker compose start worker`
+Mesmo com o work parado, continua sendo enviado pra mim se o bot executou ou não uma tarefa.
+
+*Inserir no diretamente no banco*
+
+`violates check constraint "chk_agents_monthly_token_limit"` - Validação no qual não permite colocar valor negativo diretamente no banco.
+
+`violates foreign key constraint "fk_agent_executions_agent" on table "agent_executions"` - O banco rejeitou uma alteração que violaria o relacionamento entre agente e execução, impedindo que uma execução ficasse associada a um agente inexistente.
 
 
 
