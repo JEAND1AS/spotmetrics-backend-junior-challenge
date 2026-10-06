@@ -240,21 +240,3 @@ Se algo não estiver claro — do enunciado, do projeto ou do processo — nos e
 Boa sorte, e divirta-se. 🚀
 
 **Time de Engenharia · SpotMetrics**
-
-### Validações adicionais e processamento seguro
-
-Os corpos de `POST` e `PATCH` devem ser objetos JSON; arrays (inclusive `[]`) são recusados com 400. Os campos de texto `name`, `description`, `systemPrompt` e `input` recusam o caractere nulo (`\u0000`), que o PostgreSQL não aceita. `description: null` e `PATCH` com `{}` continuam permitidos.
-
-A API verifica o saldo para o custo total de **entrada + saída simulada**, usando a mesma simulação do worker. Se o saldo for insuficiente, retorna `429` com `monthlyTokenLimit`, `tokensUsed` e `requiredTokens`, sem criar ou enfileirar a execução. O recebimento de `201` significa que a execução passou nessa validação e foi enfileirada; não há reserva de tokens. O worker confere novamente o limite, considerando **entrada + saída** e o consumo atualizado do mês de conclusão em UTC. Se o saldo ficar insuficiente até o processamento, registra `FAILED` com erro descritivo e não acrescenta consumo mensal.
-
-A conclusão e a cobrança são gravadas na mesma transação. Bloqueios nas linhas da execução e do agente impedem cobrança duplicada e disputa pelo mesmo saldo. Execuções `COMPLETED` ou `FAILED` são ignoradas quando a mensagem chega novamente. Execuções `PROCESSING` podem ser retomadas após falhas, preservando `startedAt`; o atraso simulado ocorre fora da transação.
-
-As variáveis numéricas são validadas antes de seu uso. `PORT` e `DATABASE_PORT` aceitam 1–65535, `RABBITMQ_PREFETCH` aceita 1–65535 e `PROCESSING_DELAY_MS` aceita 0–2147483647. Valores vazios, negativos, fracionários ou com letras causam erro explícito; o padrão é usado apenas quando a variável não foi definida.
-
-Para executar também os testes de transações no PostgreSQL local:
-
-```bash
-TEST_DATABASE_INTEGRATION=1 npm test -- --runInBand
-```
-
-Esses testes usam as configurações `DATABASE_*`, criam um schema temporário isolado e o removem ao terminar. O usuário do banco precisa ter permissão para criar schemas. Sem a variável acima, os testes de integração são ignorados e os demais testes rodam normalmente.
