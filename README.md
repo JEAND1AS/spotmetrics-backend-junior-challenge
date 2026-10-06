@@ -130,56 +130,13 @@ O seed cria dois agentes de exemplo. Liste com `GET /agents`.
 | Método | Rota | Descrição |
 | --- | --- | --- |
 | POST | `/agents` | Cria agente |
-| GET | `/agents` | Lista agentes com consumo mensal, saldo de tokens e consumo de hoje (UTC) |
+| GET | `/agents` | Lista agentes |
 | GET | `/agents/:id` | Detalha agente |
-| PATCH | `/agents/:id` | Atualiza parcialmente o agente; permite reativação |
-| DELETE | `/agents/:id` | Desativa o agente e preserva o histórico (204 sem corpo) |
-| GET | `/agents/:id/executions` | Histórico com paginação, filtro de status e ordenação |
-| GET | `/agents/:id/metrics` | Totais de execuções e consumo de tokens de todo o histórico |
 | GET | `/agents/:id/usage?month=YYYY-MM` | Consumo de tokens do agente no mês |
 | POST | `/agents/:id/executions` | Enfileira execução — body `{ "input": "..." }` |
 | GET | `/executions/:id` | Detalha execução |
 | GET | `/health` | Estado de Postgres e RabbitMQ |
 | GET | `/docs` | Swagger |
-
-A listagem `GET /agents` mantém os dados de cada agente e acrescenta:
-
-- `tokensUsedThisMonth`: tokens contabilizados no mês atual em UTC.
-- `tokensRemainingThisMonth`: limite mensal menos o consumo do mês, com mínimo de zero.
-- `tokensUsedToday`: tokens de entrada e saída das execuções `COMPLETED` finalizadas no dia atual em UTC, usando `completedAt`.
-
-O consumo de hoje está incluído no consumo mensal. Agentes sem consumo retornam zero nos campos de uso e o limite integral como saldo. A rota `GET /agents/:id/usage?month=YYYY-MM` continua disponível para consultas de meses específicos, com o mesmo formato de resposta.
-
-### Atualização, desativação, histórico e métricas
-
-`PATCH /agents/:id` aceita os mesmos campos da criação, todos opcionais. Campos omitidos são preservados; `description: null` limpa a descrição e `active: true` reativa um agente. Nome e prompt têm espaços das pontas removidos; o nome deve ter 2 a 120 caracteres, o prompt no mínimo 10, a descrição no máximo 500 e o limite mensal deve ser inteiro entre 1 e 100.000.000. `null` é aceito apenas na descrição. Um objeto vazio não altera os dados.
-
-`DELETE /agents/:id` define `active: false`, retorna **204 sem corpo** e pode ser repetido. O agente continua disponível nas consultas, mantendo execuções e consumo. Novas execuções recebem **409** enquanto ele estiver inativo.
-
-O histórico aceita os parâmetros:
-
-| Parâmetro | Padrão | Valores |
-| --- | --- | --- |
-| `page` | `1` | Inteiro de 1 a 2147483647 |
-| `limit` | `20` | Inteiro de 1 a 100 |
-| `status` | Todos | `PENDING`, `PROCESSING`, `COMPLETED`, `FAILED` |
-| `order` | `DESC` | `ASC` ou `DESC`, por `createdAt`, com desempate por `id` |
-
-A resposta é `{ "data": [...], "total": 42, "page": 1, "limit": 20, "totalPages": 3 }`. `total` considera o filtro; páginas além do histórico retornam `data: []`. Sem resultados, `total` e `totalPages` são zero. Parâmetros inválidos retornam **400**; agente inexistente retorna **404** em todas essas rotas.
-
-As métricas retornam `agentId`, `totalExecutions`, `completedExecutions`, `failedExecutions`, `totalTokens` e `averageTokensPerExecution`. São calculadas sobre todo o histórico: a contagem total inclui todos os status; a soma e a média de tokens consideram apenas execuções `COMPLETED`. Sem execuções concluídas, soma e média são zero. O consumo mensal continua disponível em `/agents/:id/usage`.
-
-```bash
-curl -X PATCH localhost:3000/agents/<AGENT_ID> \
-  -H 'content-type: application/json' \
-  -d '{"name":"Assistente atualizado","monthlyTokenLimit":20000}'
-
-curl 'localhost:3000/agents/<AGENT_ID>/executions?page=1&limit=10&status=COMPLETED&order=DESC'
-curl localhost:3000/agents/<AGENT_ID>/metrics
-curl -X DELETE localhost:3000/agents/<AGENT_ID>
-```
-
-Os schemas, exemplos, parâmetros e códigos de resposta estão disponíveis em `http://localhost:3000/docs` (documento OpenAPI em `/docs-json`). Depois de alterar o código, recrie os serviços que usam a imagem Docker com `docker compose up -d --build api worker`.
 
 ### Exemplo rápido
 
